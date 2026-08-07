@@ -1,0 +1,14 @@
+{
+  "name": "inanna-ishtar-news-bot",
+  "version": "1.0.0",
+  "description": "Fetches Google News for Inanna/Ishtar coverage, filters out irrelevant results (1987 film, unrelated homonyms, etc.) using Claude, and posts genuine hits to Discord.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "rss-parser": "^3.13.0",
+    "node-fetch": "^3.3.2"
+  }
+}

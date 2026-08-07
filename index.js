@@ -4,7 +4,7 @@ import { loadState, saveState, todayUTC } from "./state.js";
 import { postArticle } from "./postToDiscord.js";
 
 const REQUIRED_ENV = ["ANTHROPIC_API_KEY", "DISCORD_WEBHOOK_URL"];
-const DAILY_POST_LIMIT = 10;
+const DAILY_POST_LIMIT = 2;
 
 async function main() {
   for (const key of REQUIRED_ENV) {

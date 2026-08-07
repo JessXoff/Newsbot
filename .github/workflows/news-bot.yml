@@ -1,0 +1,40 @@
+name: Inanna/Ishtar News Bot
+
+on:
+  schedule:
+    # Runs every 6 hours. Adjust to taste — GitHub Actions free tier cron
+    # can be a few minutes late during high load, which is fine here.
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write # needed to commit the updated state.json back to the repo
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run bot
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: npm start
+
+      - name: Commit updated state
+        run: |
+          git config user.name "inanna-news-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update seen-articles state [skip ci]"
+          git push

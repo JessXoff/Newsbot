@@ -1,9 +1,10 @@
 import { fetchCandidateArticles } from "./fetchNews.js";
 import { classifyArticles } from "./classify.js";
-import { loadSeenLinks, saveSeenLinks } from "./state.js";
+import { loadState, saveState, todayUTC } from "./state.js";
 import { postArticle } from "./postToDiscord.js";
 
 const REQUIRED_ENV = ["ANTHROPIC_API_KEY", "DISCORD_WEBHOOK_URL"];
+const DAILY_POST_LIMIT = 10;
 
 async function main() {
   for (const key of REQUIRED_ENV) {
@@ -24,8 +25,16 @@ async function main() {
   const candidates = await fetchCandidateArticles();
   console.log(`Found ${candidates.length} raw candidates.`);
 
-  const seenLinks = await loadSeenLinks();
-  const unseen = candidates.filter((a) => !seenLinks.has(a.link));
+  const state = await loadState();
+  const today = todayUTC();
+
+  // Reset the counter if this is the first run of a new UTC day
+  if (state.postDate !== today) {
+    state.postDate = today;
+    state.postCount = 0;
+  }
+
+  const unseen = candidates.filter((a) => !state.seenLinks.has(a.link));
   console.log(`${unseen.length} are new since last run.`);
 
   if (unseen.length === 0) {
@@ -42,7 +51,7 @@ async function main() {
   for (const result of classifications) {
     const article = unseen[result.index];
     if (!article) continue;
-    seenLinks.add(article.link); // mark seen regardless of relevance
+    state.seenLinks.add(article.link); // mark seen regardless of relevance
     if (result.relevant) {
       relevant.push({ ...article, reason: result.reason });
     } else {
@@ -50,18 +59,33 @@ async function main() {
     }
   }
 
-  console.log(`${relevant.length} relevant article(s) to post.`);
+  console.log(`${relevant.length} relevant article(s) found this run.`);
 
-  for (const article of relevant) {
+  const remainingQuota = Math.max(0, DAILY_POST_LIMIT - state.postCount);
+  const toPost = relevant.slice(0, remainingQuota);
+  const droppedForQuota = relevant.length - toPost.length;
+
+  if (remainingQuota === 0) {
+    console.log(
+      `Daily post limit (${DAILY_POST_LIMIT}) already reached for ${today}. Skipping all ${relevant.length} relevant article(s) this run.`
+    );
+  } else if (droppedForQuota > 0) {
+    console.log(
+      `Daily post limit (${DAILY_POST_LIMIT}) reached mid-run. Posting ${toPost.length}, skipping ${droppedForQuota} for the rest of ${today}.`
+    );
+  }
+
+  for (const article of toPost) {
     try {
       await postArticle(article);
-      console.log(`Posted: ${article.title}`);
+      state.postCount += 1;
+      console.log(`Posted (${state.postCount}/${DAILY_POST_LIMIT} today): ${article.title}`);
     } catch (err) {
       console.error(`Failed to post "${article.title}":`, err.message);
     }
   }
 
-  await saveSeenLinks(seenLinks);
+  await saveState(state);
   console.log("State saved. Done.");
 }
 

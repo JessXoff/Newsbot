@@ -15,7 +15,7 @@ export async function postArticle(article) {
     timestamp: article.pubDate ? new Date(article.pubDate).toISOString() : undefined,
   };
 
-  const res = await fetch(process.env.DISCORD_WEBHOOK_URL, {
+  const res = await fetch((process.env.DISCORD_WEBHOOK_URL || "").trim(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ embeds: [embed] }),

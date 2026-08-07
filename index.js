@@ -7,10 +7,17 @@ const REQUIRED_ENV = ["ANTHROPIC_API_KEY", "DISCORD_WEBHOOK_URL"];
 
 async function main() {
   for (const key of REQUIRED_ENV) {
-    if (!process.env[key]) {
+    if (!process.env[key] || !process.env[key].trim()) {
       console.error(`Missing required environment variable: ${key}`);
       process.exit(1);
     }
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY.trim().startsWith("sk-ant-")) {
+    console.error(
+      "ANTHROPIC_API_KEY doesn't look like a valid Anthropic key (should start with 'sk-ant-'). Check the secret value for stray characters or a missing/extra prefix."
+    );
+    process.exit(1);
   }
 
   console.log("Fetching candidate articles from Google News RSS...");

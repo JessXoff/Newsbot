@@ -1,95 +1,193 @@
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { fetchCandidateArticles } from "./fetchNews.js";
+import { enrichArticles } from "./enrichArticles.js";
 import { classifyArticles } from "./classify.js";
 import { loadState, saveState, todayUTC } from "./state.js";
 import { postArticle } from "./postToDiscord.js";
+import {
+  meetsEditorialThreshold,
+  rankAndClusterArticles,
+  toPendingArticle,
+} from "./editorial.js";
 
 const REQUIRED_ENV = ["ANTHROPIC_API_KEY", "DISCORD_WEBHOOK_URL"];
-const DAILY_POST_LIMIT = 2;
+export const DAILY_POST_LIMIT = 2;
+const MAX_DELIVERY_ATTEMPTS_PER_RUN = 4;
 
-async function main() {
+export function validateEnvironment(environment = process.env) {
   for (const key of REQUIRED_ENV) {
-    if (!process.env[key] || !process.env[key].trim()) {
-      console.error(`Missing required environment variable: ${key}`);
-      process.exit(1);
+    if (!environment[key] || !environment[key].trim()) {
+      throw new Error(`Missing required environment variable: ${key}`);
     }
   }
+}
 
-  if (!process.env.ANTHROPIC_API_KEY.trim().startsWith("sk-ant-")) {
-    console.error(
-      "ANTHROPIC_API_KEY doesn't look like a valid Anthropic key (should start with 'sk-ant-'). Check the secret value for stray characters or a missing/extra prefix."
+export function applyClassifications(
+  state,
+  articles,
+  classifications,
+  { now = new Date(), logger = console } = {}
+) {
+  if (articles.length !== classifications.length) {
+    throw new Error(
+      `Received ${classifications.length} classifications for ${articles.length} articles`
     );
-    process.exit(1);
   }
 
-  console.log("Fetching candidate articles from Google News RSS...");
-  const candidates = await fetchCandidateArticles();
-  console.log(`Found ${candidates.length} raw candidates.`);
+  const pendingLinks = new Set(state.pendingArticles.map((article) => article.link));
 
-  const state = await loadState();
-  const today = todayUTC();
+  for (const classification of classifications) {
+    const article = articles[classification.index];
+    if (!article) throw new Error(`Classifier index ${classification.index} is out of range`);
 
-  // Reset the counter if this is the first run of a new UTC day
+    if (meetsEditorialThreshold(classification)) {
+      if (!pendingLinks.has(article.link) && !state.seenLinks.has(article.link)) {
+        state.pendingArticles.push(toPendingArticle(article, classification, now));
+        pendingLinks.add(article.link);
+      }
+      logger.log(
+        `Accepted for ranking: "${article.title}" — ${classification.decision}: ${classification.reason}`
+      );
+    } else {
+      state.seenLinks.add(article.link);
+      logger.log(
+        `Rejected: "${article.title}" — ${classification.decision}: ${classification.reason}`
+      );
+    }
+  }
+}
+
+export async function runBot({
+  now = new Date(),
+  environment = process.env,
+  fetchCandidates = fetchCandidateArticles,
+  enrichCandidates = enrichArticles,
+  classify = classifyArticles,
+  load = loadState,
+  save = saveState,
+  post = postArticle,
+  logger = console,
+} = {}) {
+  validateEnvironment(environment);
+
+  const state = await load();
+  const today = todayUTC(now);
+  let stateDirty = false;
+
   if (state.postDate !== today) {
     state.postDate = today;
     state.postCount = 0;
+    stateDirty = true;
   }
 
-  const unseen = candidates.filter((a) => !state.seenLinks.has(a.link));
-  console.log(`${unseen.length} are new since last run.`);
-
-  if (unseen.length === 0) {
-    console.log("Nothing new. Done.");
-    return;
+  const initialQuota = Math.max(0, DAILY_POST_LIMIT - state.postCount);
+  if (initialQuota === 0) {
+    logger.log(
+      `Daily post limit (${DAILY_POST_LIMIT}) already reached for ${today}; deferring new work until tomorrow.`
+    );
+    if (stateDirty) await save(state);
+    return { fetched: 0, classified: 0, posted: 0, pending: state.pendingArticles.length };
   }
 
-  console.log("Classifying relevance with Claude...");
-  const classifications = await classifyArticles(
-    unseen.map((a) => ({ title: a.title, snippet: a.snippet }))
+  logger.log("Fetching recent candidate articles from Google News RSS...");
+  const candidates = await fetchCandidates({ now });
+  logger.log(`Found ${candidates.length} recent candidate(s).`);
+
+  const pendingLinks = new Set(state.pendingArticles.map((article) => article.link));
+  const unseen = candidates.filter(
+    (article) => !state.seenLinks.has(article.link) && !pendingLinks.has(article.link)
   );
+  logger.log(`${unseen.length} candidate(s) need editorial review.`);
 
-  const relevant = [];
-  for (const result of classifications) {
-    const article = unseen[result.index];
-    if (!article) continue;
-    state.seenLinks.add(article.link); // mark seen regardless of relevance
-    if (result.relevant) {
-      relevant.push({ ...article, reason: result.reason });
-    } else {
-      console.log(`Filtered out: "${article.title}" — ${result.reason}`);
+  let classifiedCount = 0;
+  if (unseen.length > 0) {
+    logger.log("Resolving publisher pages and extracting article evidence...");
+    const enriched = await enrichCandidates(unseen);
+    const readyForReview = [];
+
+    for (const article of enriched) {
+      if (article.enrichmentStatus === "decode_failed") {
+        logger.warn(
+          `Deferred because the publisher URL could not be resolved: "${article.title}" — ${article.enrichmentError}`
+        );
+      } else {
+        readyForReview.push(article);
+      }
+    }
+
+    if (readyForReview.length > 0) {
+      logger.log("Applying relevance, credibility, and quality policy with Claude...");
+      const classifications = await classify(readyForReview);
+      applyClassifications(state, readyForReview, classifications, { now, logger });
+      classifiedCount = readyForReview.length;
+      stateDirty = true;
     }
   }
 
-  console.log(`${relevant.length} relevant article(s) found this run.`);
-
-  const remainingQuota = Math.max(0, DAILY_POST_LIMIT - state.postCount);
-  const toPost = relevant.slice(0, remainingQuota);
-  const droppedForQuota = relevant.length - toPost.length;
-
-  if (remainingQuota === 0) {
-    console.log(
-      `Daily post limit (${DAILY_POST_LIMIT}) already reached for ${today}. Skipping all ${relevant.length} relevant article(s) this run.`
-    );
-  } else if (droppedForQuota > 0) {
-    console.log(
-      `Daily post limit (${DAILY_POST_LIMIT}) reached mid-run. Posting ${toPost.length}, skipping ${droppedForQuota} for the rest of ${today}.`
-    );
+  // Persist new pending/rejected decisions before any external delivery.
+  if (stateDirty) {
+    await save(state);
+    stateDirty = false;
   }
 
-  for (const article of toPost) {
+  if (state.pendingArticles.length === 0) {
+    logger.log("No publishable articles are pending. Done.");
+    return { fetched: candidates.length, classified: classifiedCount, posted: 0, pending: 0 };
+  }
+
+  const clusters = rankAndClusterArticles(state.pendingArticles, now);
+  let posted = 0;
+  let attempted = 0;
+
+  for (const cluster of clusters) {
+    if (
+      state.postCount >= DAILY_POST_LIMIT ||
+      attempted >= MAX_DELIVERY_ATTEMPTS_PER_RUN
+    ) {
+      break;
+    }
+
+    attempted += 1;
+    const article = cluster.representative;
     try {
-      await postArticle(article);
+      await post(article);
       state.postCount += 1;
-      console.log(`Posted (${state.postCount}/${DAILY_POST_LIMIT} today): ${article.title}`);
-    } catch (err) {
-      console.error(`Failed to post "${article.title}":`, err.message);
+      posted += 1;
+
+      const completedLinks = new Set(cluster.members.map((member) => member.link));
+      for (const link of completedLinks) state.seenLinks.add(link);
+      state.pendingArticles = state.pendingArticles.filter(
+        (pending) => !completedLinks.has(pending.link)
+      );
+
+      // Save after every confirmed Discord delivery to minimize duplicate risk.
+      await save(state);
+      logger.log(
+        `Posted (${state.postCount}/${DAILY_POST_LIMIT} today): ${article.title}`
+      );
+    } catch (error) {
+      logger.error(`Failed to post "${article.title}"; retained for retry:`, error.message);
     }
   }
 
-  await saveState(state);
-  console.log("State saved. Done.");
+  logger.log(
+    `Done. Posted ${posted}; ${state.pendingArticles.length} accepted article(s) remain pending.`
+  );
+  return {
+    fetched: candidates.length,
+    classified: classifiedCount,
+    posted,
+    pending: state.pendingArticles.length,
+  };
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+const isDirectRun =
+  process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isDirectRun) {
+  runBot().catch((error) => {
+    console.error("Fatal error:", error);
+    process.exitCode = 1;
+  });
+}

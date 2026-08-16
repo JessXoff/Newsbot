@@ -1,6 +1,8 @@
 import Parser from "rss-parser";
+import { withRetry } from "./http.js";
 
 const parser = new Parser({
+  timeout: 15_000,
   customFields: {
     item: [["source", "source"]],
   },
@@ -8,7 +10,8 @@ const parser = new Parser({
 
 // Search terms to cover. Each becomes its own Google News RSS query so we
 // don't miss results Google's OR-matching might rank low.
-const SEARCH_TERMS = ["Inanna", "Ishtar goddess", "Ishtar Mesopotamian"];
+const SEARCH_TERMS = ['"Inanna"', '"Ishtar" goddess', '"Ishtar" Mesopotamian'];
+export const DEFAULT_MAX_ARTICLE_AGE_DAYS = 45;
 
 const GOOGLE_NEWS_RSS = (query) =>
   `https://news.google.com/rss/search?q=${encodeURIComponent(
@@ -19,14 +22,40 @@ const GOOGLE_NEWS_RSS = (query) =>
  * Fetch and merge RSS results for all search terms, deduping by link.
  * Returns an array of { title, link, pubDate, source, snippet }.
  */
-export async function fetchCandidateArticles() {
+export function isRecentPublication(
+  pubDate,
+  { now = new Date(), maxAgeDays = DEFAULT_MAX_ARTICLE_AGE_DAYS } = {}
+) {
+  const published = Date.parse(pubDate || "");
+  if (!Number.isFinite(published)) return false;
+
+  const age = now.getTime() - published;
+  return age >= -86_400_000 && age <= maxAgeDays * 86_400_000;
+}
+
+function configuredMaxAgeDays() {
+  const configured = Number(process.env.MAX_ARTICLE_AGE_DAYS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_MAX_ARTICLE_AGE_DAYS;
+}
+
+export async function fetchCandidateArticles({
+  now = new Date(),
+  maxAgeDays = configuredMaxAgeDays(),
+  parseUrl = (url) => parser.parseURL(url),
+} = {}) {
   const seenLinks = new Set();
   const articles = [];
+  let successfulFeeds = 0;
 
   for (const term of SEARCH_TERMS) {
     let feed;
     try {
-      feed = await parser.parseURL(GOOGLE_NEWS_RSS(term));
+      feed = await withRetry(() => parseUrl(GOOGLE_NEWS_RSS(term)), {
+        attempts: 3,
+      });
+      successfulFeeds += 1;
     } catch (err) {
       console.error(`Failed to fetch RSS for "${term}":`, err.message);
       continue;
@@ -35,12 +64,16 @@ export async function fetchCandidateArticles() {
     for (const item of feed.items || []) {
       const link = normalizeLink(item.link);
       if (!link || seenLinks.has(link)) continue;
+
+      const pubDate = item.pubDate || item.isoDate || null;
+      if (!isRecentPublication(pubDate, { now, maxAgeDays })) continue;
+
       seenLinks.add(link);
 
       articles.push({
         title: item.title?.trim() || "(untitled)",
         link,
-        pubDate: item.pubDate || item.isoDate || null,
+        pubDate,
         source:
           (typeof item.source === "string" && item.source) ||
           item.source?._ ||
@@ -51,12 +84,17 @@ export async function fetchCandidateArticles() {
     }
   }
 
-  return articles;
+  if (successfulFeeds === 0) {
+    throw new Error("All Google News RSS requests failed");
+  }
+
+  return articles.sort(
+    (left, right) => Date.parse(right.pubDate) - Date.parse(left.pubDate)
+  );
 }
 
-// Google News RSS links are redirect URLs; strip tracking params so the
-// same underlying article doesn't get treated as "new" every run.
-function normalizeLink(link) {
+// Keep Google's stable article identifier while removing RSS tracking params.
+export function normalizeLink(link) {
   if (!link) return null;
   try {
     const url = new URL(link);

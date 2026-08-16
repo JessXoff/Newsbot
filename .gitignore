@@ -1,2 +1,4 @@
 node_modules/
 .env
+state.json.*.tmp
+npm-debug.log*

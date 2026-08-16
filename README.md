@@ -1,69 +1,124 @@
 # Inanna / Ishtar News Bot
 
-Watches Google News for coverage of the goddess Inanna/Ishtar, filters out
-false positives (the 1987 Warren Beatty film, unrelated people/places/products
-named Ishtar or Inanna, etc.) using Claude, and posts genuine hits to a
-Discord channel as gold embeds.
+This bot watches Google News for substantive coverage of the Mesopotamian
+goddess Inanna/Ishtar. It resolves publisher pages, extracts article evidence,
+applies a conservative relevance/credibility/quality policy with Claude, ranks
+accepted work, and posts at most two items per UTC day to Discord.
 
-Runs the same way as the prayer bot: free via GitHub Actions cron, no server
-to maintain.
+It runs on a six-hour GitHub Actions schedule and persists its delivery state in
+`state.json`; no server is required.
 
-## How it works
+## Editorial policy
 
-1. **`fetchNews.js`** — queries Google News RSS for a few search terms
-   ("Inanna", "Ishtar goddess", "Ishtar Mesopotamian") and merges/dedupes the
-   results by link.
-2. **`state.js`** — loads/saves `state.json`, a small list of article links
-   already seen, so the same story doesn't get reposted every run.
-3. **`classify.js`** — sends unseen article titles/snippets to Claude in one
-   batched call and gets back a relevant/not-relevant verdict with a short
-   reason for each, so the film and homonym noise gets filtered before
-   anything reaches Discord.
-4. **`postToDiscord.js`** — posts each relevant article as a gold embed via
-   your Discord webhook.
-5. **`index.js`** — ties it all together; this is what actually runs.
-6. **`.github/workflows/news-bot.yml`** — runs `index.js` every 6 hours via
-   GitHub Actions and commits the updated `state.json` back to the repo so
-   state persists between runs.
+An article must pass one of two acceptance paths:
+
+- **Academic or historical coverage:** legitimate scholarship, named scholars,
+  universities, museums, archaeological institutions, academic publishers,
+  excavations, catalogued artifacts, responsible translations, or careful
+  journalism accurately grounded in those sources.
+- **Contemporary liturgical or devotional work:** an attributable modern prayer,
+  hymn, ritual, devotional essay, reconstruction, performance, or living
+  practice that is honestly presented as contemporary interpretation.
+
+The bot hard-rejects material that promotes conspiracy theories,
+pseudoarchaeology, pseudohistory, ancient-aliens claims, fabricated artifacts or
+translations, "suppressed history," racialist mythology, unverifiable
+content-farm claims, or modern inventions falsely presented as ancient texts.
+Religious and poetic language is not treated as crank content when it is clearly
+framed as faith, ritual, metaphor, or contemporary creative work.
+
+Other rejection categories cover irrelevant homonyms, shallow/clickbait work,
+and insufficient evidence. Uncertainty fails closed: an item is not posted when
+the available source and article text cannot establish credibility.
+
+Claude returns structured classifications with relevance, credibility,
+substance, quality, and confidence scores. Deterministic thresholds are applied
+after classification, so a weak model acceptance cannot bypass the editorial
+floor. Accepted articles are ranked by quality, credibility, substance, and
+freshness; similar headlines and canonical URLs are grouped as one story.
+
+## Processing and delivery lifecycle
+
+1. `fetchNews.js` queries three Google News RSS searches, discards malformed,
+   future-dated, and stale results, deduplicates links, and sorts newest-first.
+2. `enrichArticles.js` resolves Google News links to publisher URLs and extracts
+   page title, author, publication metadata, and up to 6,000 characters of
+   article evidence. Private/local network targets are rejected.
+3. `classify.js` sends batches to Claude Sonnet 5 using a JSON-schema structured
+   output and validates every returned index and score locally.
+4. `editorial.js` applies the deterministic acceptance floor, ranks accepted
+   work, and clusters duplicate coverage.
+5. `postToDiscord.js` posts the best pending articles as gold embeds using the
+   publisher URL.
+6. `state.js` atomically stores completed links, accepted pending articles, and
+   the UTC daily-post counter.
+
+Rejected articles are marked finished. Accepted articles remain pending until a
+Discord post succeeds. Items beyond the daily quota and transiently failed posts
+remain pending for later runs rather than being silently lost. State is saved
+before delivery and after each confirmed post.
 
 ## Setup
 
-1. **Create a private GitHub repo** and push these files to it.
+1. Create a private GitHub repository and add these files.
+2. For a brand-new bot or Discord channel, clear the included operational
+   history before the first push:
 
-2. **Add two repository secrets** (Settings → Secrets and variables →
-   Actions → New repository secret):
-   - `ANTHROPIC_API_KEY` — your Anthropic API key
-   - `DISCORD_WEBHOOK_URL` — the webhook URL for the Discord channel you want
-     posts to land in (Channel Settings → Integrations → Webhooks → New
-     Webhook → Copy URL)
+   ```bash
+   npm ci
+   npm run reset-state
+   ```
 
-3. **Enable Actions** on the repo if it's not on by default (Settings →
-   Actions → General → Allow all actions).
+   Do not reset state when upgrading an existing deployment; its seen and
+   pending records prevent duplicate Discord posts.
+3. Add two repository Actions secrets under **Settings → Secrets and variables
+   → Actions**:
 
-4. That's it — the workflow will run automatically every 6 hours. You can
-   also trigger a run manually from the Actions tab (`workflow_dispatch`) to
-   test it right away without waiting for the schedule.
+   - `ANTHROPIC_API_KEY`
+   - `DISCORD_WEBHOOK_URL`
 
-## Local testing
+4. Enable GitHub Actions. The workflow runs every six hours and can also be run
+   manually with `workflow_dispatch`.
+
+The workflow serializes runs, executes the automated tests, runs the bot, and
+commits `state.json` even when a later bot operation fails. Dependency versions
+are locked and installed with `npm ci`.
+
+## Local checks
 
 ```bash
-npm install
+npm ci
+npm run check
+npm test
+```
+
+To run the real bot locally:
+
+```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 export DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 npm start
 ```
 
-## Tuning
+This performs real Anthropic API calls and may post to Discord.
 
-- **Schedule**: change the `cron` line in the workflow file. `"0 */6 * * *"`
-  is every 6 hours; `"0 */3 * * *"` would be every 3 hours, etc.
-- **Search terms**: edit `SEARCH_TERMS` in `fetchNews.js` if you want to
-  broaden or narrow coverage (e.g. add "Sumerian goddess" or "Qadishtu").
-- **Filtering strictness**: the classification rules live in the
-  `SYSTEM_PROMPT` in `classify.js` — edit that text directly to loosen or
-  tighten what counts as relevant.
-- **Model**: `classify.js` uses `claude-sonnet-5` by default; swap the
-  `MODEL` constant if you'd rather use a different Claude model.
-- **State window**: `state.js` keeps the most recent 500 seen links to keep
-  `state.json` small forever; raise `MAX_TRACKED_LINKS` if you want a longer
-  memory.
+## Configuration
+
+- **Schedule:** edit the cron expression in `.github/workflows/news-bot.yml`.
+- **Daily limit:** edit `DAILY_POST_LIMIT` in `index.js`.
+- **Search terms:** edit `SEARCH_TERMS` in `fetchNews.js`.
+- **Recency:** set `MAX_ARTICLE_AGE_DAYS`; the default is 45 days.
+- **Editorial policy:** edit `SYSTEM_PROMPT` and the structured decision schema in
+  `classify.js`, plus deterministic thresholds in `editorial.js`.
+- **Model:** edit `MODEL` in `classify.js`.
+- **Seen-link window:** edit `MAX_TRACKED_LINKS` in `state.js`.
+
+Publisher pages that cannot be resolved are deferred for a future run. Pages
+that resolve but block extraction may still be assessed from publisher
+provenance and RSS metadata, but the conservative policy normally rejects them
+when that evidence is insufficient.
+
+Discord webhooks do not provide an idempotency key. The bot minimizes duplicate
+risk through serialized runs and immediate atomic state saves, but a network
+timeout occurring after Discord accepts a message can never be distinguished
+perfectly from a failed delivery.
